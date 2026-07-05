@@ -2020,12 +2020,174 @@ run(function()
 	local AnimationTween
 	local Limit
 	local LegitAura
+	-- NEW ENHANCEMENT VARIABLES
+	local SwingTime
+	local BetterHitreg
+	local HitregPoints
+	local ReachOffset
+	local VerticalRange
+	local MultiHit
+	local PredictMovement
+	local PredictionStrength
+	local RaycastCheck
+	local SmartTarget
+	local ConeCheck
+	local ConeSize
 	local Particles, Boxes = {}, {}
 	local anims, AnimDelay, AnimTween, armC0 = vape.Libraries.auraanims, tick()
 	local AttackRemote = {FireServer = function() end}
+	local swingtick = tick()
+	local lastAttackTick = tick()
+
 	task.spawn(function()
 		AttackRemote = bedwars.Client:Get(remotes.AttackEntity).instance
 	end)
+
+	-- NEW: Multi-point hitbox system for better registration
+	local baseHitboxPoints = {
+		Vector3.new(0, 0, 0),        -- root center
+		Vector3.new(0, 1.5, 0),      -- upper torso
+		Vector3.new(0, -1.5, 0),     -- legs
+		Vector3.new(0, 2.5, 0),      -- head
+		Vector3.new(0, -2.5, 0),     -- feet
+		Vector3.new(1, 0, 0),        -- right side
+		Vector3.new(-1, 0, 0),       -- left side
+		Vector3.new(0, 0, 1),        -- front
+		Vector3.new(0, 0, -1),       -- back
+		Vector3.new(0.75, 1.5, 0),   -- upper right
+		Vector3.new(-0.75, 1.5, 0),  -- upper left
+		Vector3.new(0.75, -1.5, 0),  -- lower right
+	}
+
+	local function getHitboxPoints(vrange, count)
+		local out = {}
+		local scale = vrange / 4.5
+		for i = 1, math.min(count, #baseHitboxPoints) do
+			local p = baseHitboxPoints[i]
+			if p.Y ~= 0 then
+				p = Vector3.new(p.X, p.Y * scale, p.Z)
+			end
+			table.insert(out, p)
+		end
+		return out
+	end
+
+	-- NEW: Movement prediction
+	local function getPredictedPosition(ent, strength)
+		if not PredictMovement or not PredictMovement.Enabled or strength <= 0 then
+			return ent.RootPart.Position
+		end
+		local root = ent.RootPart
+		local vel = root.Velocity
+		-- Clamp prediction to avoid overshooting on fast movers
+		local maxPred = 5
+		local pred = vel * strength
+		if pred.Magnitude > maxPred then
+			pred = pred.Unit * maxPred
+		end
+		return root.Position + pred
+	end
+
+	-- NEW: Raycast validation to prevent ghost hits
+	local hitregParams = RaycastParams.new()
+	hitregParams.RespectCanCollide = true
+
+	local function canHit(selfpos, targetpos, targetChar)
+		if not RaycastCheck or not RaycastCheck.Enabled then return true end
+		local dir = targetpos - selfpos
+		hitregParams.FilterDescendantsInstances = {lplr.Character, gameCamera}
+		local result = workspace:Raycast(selfpos, dir, hitregParams)
+		if result and result.Instance then
+			if targetChar and result.Instance:IsDescendantOf(targetChar) then
+				return true
+			end
+			return false
+		end
+		return true
+	end
+
+	-- NEW: Cone check for angle-based hit validation
+	local function passesConeCheck(selfpos, targetpos, facing)
+		if not ConeCheck or not ConeCheck.Enabled then return true end
+		local dir = (targetpos - selfpos).Unit
+		local dot = facing:Dot(dir)
+		local maxDot = math.cos(math.rad(ConeSize.Value))
+		return dot >= maxDot
+	end
+
+	-- NEW: Enhanced attack function with multi-point hitreg
+	local function fireAttack(v, sword, selfpos, attackrange, reachoffset, facing)
+		local actualRoot = v.Character.PrimaryPart
+		if not actualRoot then return false end
+
+		local targetpos = getPredictedPosition(v, PredictionStrength and PredictionStrength.Value or 0)
+		local hitpoints = BetterHitreg and BetterHitreg.Enabled and getHitboxPoints(VerticalRange.Value, HitregPoints.Value) or {Vector3.zero}
+		local hit = false
+		local bestPoint = nil
+		local bestDist = math.huge
+
+		-- Find the best hittable point first
+		for _, offset in hitpoints do
+			local point = targetpos + offset
+			local delta = point - selfpos
+			local dist = delta.Magnitude
+
+			if dist > attackrange then continue end
+			if dist < bestDist then
+				bestDist = dist
+				bestPoint = point
+			end
+		end
+
+		if not bestPoint then return false end
+
+		-- Fire at best point first (single hit mode)
+		if not (MultiHit and MultiHit.Enabled) then
+			hitpoints = {bestPoint - targetpos}
+		end
+
+		for _, offset in hitpoints do
+			local point = targetpos + offset
+			local delta = point - selfpos
+			local dist = delta.Magnitude
+
+			if dist > attackrange then continue end
+
+			local dir = delta.Unit
+
+			-- Reach spoof - extend selfPosition outward
+			local spoofedPos = selfpos + dir * math.max(dist - reachoffset, 0)
+
+			-- Cone check
+			if not passesConeCheck(spoofedPos, point, facing) then continue end
+
+			-- Raycast validation
+			if not canHit(spoofedPos, point, v.Character) then continue end
+
+			bedwars.SwordController.lastAttack = workspace:GetServerTimeNow()
+			store.attackReach = (dist * 100) // 1 / 100
+			store.attackReachUpdate = tick() + 1
+
+			AttackRemote:FireServer({
+				weapon = sword.tool,
+				chargedAttack = {chargeRatio = 0},
+				entityInstance = v.Character,
+				validate = {
+					raycast = {
+						cameraPosition = {value = spoofedPos},
+						cursorDirection = {value = dir}
+					},
+					targetPosition = {value = point},
+					selfPosition = {value = spoofedPos}
+				}
+			})
+			hit = true
+
+			if not (MultiHit and MultiHit.Enabled) then break end
+		end
+
+		return hit
+	end
 
 	local function getAttackData()
 		if Mouse.Enabled then
@@ -2121,6 +2283,13 @@ run(function()
 					local attacked, sword, meta = {}, getAttackData()
 					Attacking = false
 					store.KillauraTarget = nil
+
+					-- NEW: Swing time delay (adjustable, defaults to 0)
+					if SwingTime.Value > 0 and (tick() - lastAttackTick) < SwingTime.Value then
+						task.wait(0.01)
+						continue
+					end
+
 					if sword then
 						local plrs = entitylib.AllPosition({
 							Range = SwingRange.Value,
@@ -2138,7 +2307,9 @@ run(function()
 							local localfacing = entitylib.character.RootPart.CFrame.LookVector * Vector3.new(1, 0, 1)
 
 							for _, v in plrs do
-								local delta = (v.RootPart.Position - selfpos)
+								-- NEW: Use predicted position for angle check
+								local predictedPos = getPredictedPosition(v, PredictionStrength and PredictionStrength.Value or 0)
+								local delta = (predictedPos - selfpos)
 								local angle = math.acos(localfacing:Dot((delta * Vector3.new(1, 0, 1)).Unit))
 								if angle > (math.rad(AngleSlider.Value) / 2) then continue end
 
@@ -2166,28 +2337,9 @@ run(function()
 
 								if delta.Magnitude > AttackRange.Value then continue end
 
-								local actualRoot = v.Character.PrimaryPart
-								if actualRoot then
-									local dir = CFrame.lookAt(selfpos, actualRoot.Position).LookVector
-									local pos = selfpos + dir * math.max(delta.Magnitude - 14.399, 0)
-									bedwars.SwordController.lastAttack = workspace:GetServerTimeNow()
-									store.attackReach = (delta.Magnitude * 100) // 1 / 100
-									store.attackReachUpdate = tick() + 1
-
-									AttackRemote:FireServer({
-										weapon = sword.tool,
-										chargedAttack = {chargeRatio = 0},
-										entityInstance = v.Character,
-										validate = {
-											raycast = {
-												cameraPosition = {value = pos},
-												cursorDirection = {value = dir}
-											},
-											targetPosition = {value = actualRoot.Position},
-											selfPosition = {value = pos}
-										}
-									})
-								end
+								-- NEW: Enhanced attack with multi-point hitreg
+								local facing3d = entitylib.character.RootPart.CFrame.LookVector
+								fireAttack(v, sword, selfpos, AttackRange.Value, ReachOffset.Value, facing3d)
 							end
 						end
 					end
@@ -2210,6 +2362,7 @@ run(function()
 						entitylib.character.RootPart.CFrame = CFrame.lookAt(entitylib.character.RootPart.Position, Vector3.new(vec.X, entitylib.character.RootPart.Position.Y + 0.001, vec.Z))
 					end
 
+					lastAttackTick = tick()
 					task.wait(#attacked > 0 and #attacked * 0.02 or 1 / UpdateRate.Value)
 				until not Killaura.Enabled
 			else
@@ -2236,7 +2389,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Attack players around you\nwithout aiming at them.'
+		Tooltip = 'Attack players around you\nwithout aiming at them.\nEnhanced: Multi-point hitreg, prediction, extended reach.'
 	})
 	Targets = Killaura:CreateTargets({
 		Players = true,
@@ -2251,7 +2404,7 @@ run(function()
 	SwingRange = Killaura:CreateSlider({
 		Name = 'Swing range',
 		Min = 1,
-		Max = 28,
+		Max = 50,
 		Default = 28,
 		Suffix = function(val)
 			return val == 1 and 'stud' or 'studs'
@@ -2260,11 +2413,29 @@ run(function()
 	AttackRange = Killaura:CreateSlider({
 		Name = 'Attack range',
 		Min = 1,
-		Max = 28,
+		Max = 50,
 		Default = 28,
 		Suffix = function(val)
 			return val == 1 and 'stud' or 'studs'
 		end
+	})
+	-- NEW: Reach offset slider (controls the reach spoof aggressiveness)
+	ReachOffset = Killaura:CreateSlider({
+		Name = 'Reach Offset',
+		Min = 8,
+		Max = 18,
+		Default = 14.399,
+		Decimal = 1000,
+		Tooltip = 'Lower = more aggressive reach spoof (more reach)\nHigher = safer but less reach\nDefault 14.399 matches server tolerance'
+	})
+	-- NEW: Vertical range for tall hitboxes
+	VerticalRange = Killaura:CreateSlider({
+		Name = 'Vertical Range',
+		Min = 1,
+		Max = 12,
+		Default = 4.5,
+		Decimal = 10,
+		Tooltip = 'Extends hitbox points vertically for better registration on jumping/crouching targets'
 	})
 	AngleSlider = Killaura:CreateSlider({
 		Name = 'Max angle',
@@ -2282,16 +2453,111 @@ run(function()
 	MaxTargets = Killaura:CreateSlider({
 		Name = 'Max targets',
 		Min = 1,
-		Max = 5,
+		Max = 10,
 		Default = 5
 	})
 	Sort = Killaura:CreateDropdown({
 		Name = 'Target Mode',
 		List = methods
 	})
+	-- NEW: Swing time (adjustable, defaults to 0)
+	SwingTime = Killaura:CreateSlider({
+		Name = 'Swing Time',
+		Min = 0,
+		Max = 1,
+		Default = 0,
+		Decimal = 100,
+		Suffix = 's',
+		Tooltip = 'Delay between attack cycles\n0 = no delay (maximum speed)\nHigher = slower but more legit-looking'
+	})
 	Mouse = Killaura:CreateToggle({Name = 'Require mouse down'})
 	Swing = Killaura:CreateToggle({Name = 'No Swing'})
 	GUI = Killaura:CreateToggle({Name = 'GUI check'})
+	-- NEW: Better hit registration (toggable)
+	BetterHitreg = Killaura:CreateToggle({
+		Name = 'Better Hitreg',
+		Default = true,
+		Tooltip = 'Multi-point hitbox raycasting\nEliminates ghost hits by trying multiple points on the target',
+		Function = function(callback)
+			if HitregPoints.Object then
+				HitregPoints.Object.Visible = callback
+			end
+			if RaycastCheck.Object then
+				RaycastCheck.Object.Visible = callback
+			end
+			if MultiHit.Object then
+				MultiHit.Object.Visible = callback
+			end
+		end
+	})
+	-- NEW: Number of hitreg points
+	HitregPoints = Killaura:CreateSlider({
+		Name = 'Hitreg Points',
+		Min = 1,
+		Max = 12,
+		Default = 4,
+		Tooltip = 'More points = better registration but more packets\n4 is a good balance',
+		Darker = true,
+		Visible = false
+	})
+	-- NEW: Multi-hit (fire all points per target)
+	MultiHit = Killaura:CreateToggle({
+		Name = 'Multi-Hit',
+		Default = false,
+		Tooltip = 'Fires at ALL hitreg points per target\nMassively improves registration but increases packet rate',
+		Darker = true,
+		Visible = false
+	})
+	-- NEW: Raycast validation
+	RaycastCheck = Killaura:CreateToggle({
+		Name = 'Raycast Check',
+		Default = true,
+		Tooltip = 'Pre-validates hits before sending\nPrevents ghost hits entirely by checking line of sight',
+		Darker = true,
+		Visible = false
+	})
+	-- NEW: Movement prediction
+	PredictMovement = Killaura:CreateToggle({
+		Name = 'Movement Prediction',
+		Default = true,
+		Tooltip = 'Predicts target position based on velocity\nImproves hit rate on fast-moving targets',
+		Function = function(callback)
+			if PredictionStrength.Object then
+				PredictionStrength.Object.Visible = callback
+			end
+		end
+	})
+	PredictionStrength = Killaura:CreateSlider({
+		Name = 'Prediction Strength',
+		Min = 0,
+		Max = 0.5,
+		Default = 0.1,
+		Decimal = 100,
+		Tooltip = 'Higher = more prediction ahead\n0.1 is good for most cases\nToo high will overshoot',
+		Darker = true,
+		Visible = false
+	})
+	-- NEW: Cone check for angle-based validation
+	ConeCheck = Killaura:CreateToggle({
+		Name = 'Cone Check',
+		Default = false,
+		Tooltip = 'Only fires if target is within a cone in front of you\nHelps with legit gameplay',
+		Function = function(callback)
+			if ConeSize.Object then
+				ConeSize.Object.Visible = callback
+			end
+		end
+	})
+	ConeSize = Killaura:CreateSlider({
+		Name = 'Cone Size',
+		Min = 10,
+		Max = 180,
+		Default = 90,
+		Suffix = '°',
+		Tooltip = 'Wider cone = more targets accepted',
+		Darker = true,
+		Visible = false
+	})
 	Killaura:CreateToggle({
 		Name = 'Show target',
 		Function = function(callback)
